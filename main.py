@@ -25,8 +25,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
-# ──────────────────────────── Constants ────────────────────────────
-
+# Constants
 CAS_LOGIN_URL = (
     "https://auth.bupt.edu.cn/authserver/login?service=https://ucloud.bupt.edu.cn"
 )
@@ -45,7 +44,7 @@ console = Console()
 
 _BACK = "__back__"
 _EXIT = "__exit__"
-_NAV_HINT = "(enter=confirm, b=back, e=exit)"
+_NAV_HINT = "(enter=confirm, b=back, q=quit)"
 
 
 def _add_nav_keys(question: questionary.Question) -> questionary.Question:
@@ -56,16 +55,14 @@ def _add_nav_keys(question: questionary.Question) -> questionary.Question:
     def _back(event: object) -> None:
         event.app.exit(result=_BACK)  # type: ignore[attr-defined]
 
-    @kb.add("e", eager=True)
+    @kb.add("q", eager=True)
     def _exit(event: object) -> None:
-        event.app.exit(result=_EXIT)  # type: ignore[attr-defined]
+        event.app.exit(result=_EXIT)
 
     return question
 
 
-# ──────────────────────────── Models ───────────────────────────────
-
-
+# Models
 class Session(BaseModel):
     """Persisted session data."""
 
@@ -91,9 +88,7 @@ class Attachment(BaseModel):
     size: str = ""
 
 
-# ──────────────────────────── Client ──────────────────────────────
-
-
+# Client
 class BUPTClient:
     """BUPT uCloud client — handles auth, API calls, and downloads."""
 
@@ -105,8 +100,7 @@ class BUPTClient:
         self._session: Session | None = None
         self._client: httpx.AsyncClient | None = None
 
-    # ── Lifecycle ─────────────────────────────────────────────────
-
+    # Lifecycle
     async def __aenter__(self) -> BUPTClient:
         self._client = httpx.AsyncClient(
             headers={**YKT_HEADERS},
@@ -121,11 +115,12 @@ class BUPTClient:
 
     @property
     def client(self) -> httpx.AsyncClient:
-        assert self._client is not None, "Use `async with BUPTClient()` as context manager"
+        assert self._client is not None, (
+            "Use `async with BUPTClient()` as context manager"
+        )
         return self._client
 
-    # ── Session persistence ──────────────────────────────────────
-
+    # Session persistence
     def _load_session(self) -> Session | None:
         """Load cached session; returns None if missing or expired."""
         if not self.SESSION_FILE.exists():
@@ -164,15 +159,16 @@ class BUPTClient:
         else:
             console.print("[dim]Not logged in[/]")
 
-    # ── Authentication ────────────────────────────────────────────
-
+    # Authentication
     async def login(self) -> None:
         """Restore cached session or perform CAS → ticket → JWT login."""
         cached = self._load_session()
         if cached:
             self._session = cached
             self.client.headers["Blade-Auth"] = cached.access_token
-            console.print(f"[green]✓ Restored session from cache (user_id: {cached.user_id})[/]")
+            console.print(
+                f"[green]✓ Restored session from cache (user_id: {cached.user_id})[/]"
+            )
             return
 
         console.print("[bold]🔐 BUPT CAS Login[/]")
@@ -182,7 +178,9 @@ class BUPTClient:
 
         match = EXECUTION_RE.search(res.text)
         if not match:
-            console.print("[red]✗ Failed to extract execution param, CAS page may have changed[/]")
+            console.print(
+                "[red]✗ Failed to extract execution param, CAS page may have changed[/]"
+            )
             sys.exit(1)
 
         execution = match.group(1)
@@ -239,8 +237,7 @@ class BUPTClient:
 
         console.print(f"[green]✓ Login successful (user_id: {user_id})[/]")
 
-    # ── API ────────────────────────────────────────────────────────
-
+    # API calls
     @property
     def session(self) -> Session:
         assert self._session is not None, "Call login() first"
@@ -305,8 +302,7 @@ class BUPTClient:
                     )
         return attachments
 
-    # ── Download ──────────────────────────────────────────────────
-
+    # Download
     async def _download_one(
         self,
         dl_client: httpx.AsyncClient,
@@ -326,14 +322,14 @@ class BUPTClient:
                     f.write(chunk)
                     progress.advance(task_id, len(chunk))
 
-    async def download_files(self, files: list[Attachment], dest_dir: Path | None = None) -> None:
+    async def download_files(
+        self, files: list[Attachment], dest_dir: Path | None = None
+    ) -> None:
         """Download files concurrently with a rich progress bar."""
         dest = dest_dir or self.DOWNLOAD_DIR
         dest.mkdir(parents=True, exist_ok=True)
 
-        async with httpx.AsyncClient(
-            follow_redirects=True, timeout=120.0
-        ) as dl_client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as dl_client:
             with Progress(
                 TextColumn("[bold blue]{task.fields[filename]}"),
                 BarColumn(),
@@ -356,9 +352,7 @@ class BUPTClient:
         console.print(f"\n[green]✓ Downloaded {len(files)} file(s) to {dest}[/]")
 
 
-# ──────────────────────────── CLI Entry ───────────────────────────
-
-
+# CLI Entry
 async def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "logout":
         BUPTClient().logout()
@@ -395,15 +389,21 @@ async def main() -> None:
                 if not selected or selected in (_BACK, _EXIT):
                     return
 
-                console.print(f"\n[bold]📂 Fetching resources for [{selected.site_name}]...[/]")
+                console.print(
+                    f"\n[bold]📂 Fetching resources for [{selected.site_name}]...[/]"
+                )
                 attachments = await client.get_resources(selected.id)
                 if not attachments:
-                    console.print("[yellow]No downloadable attachments for this course[/]\n")
+                    console.print(
+                        "[yellow]No downloadable attachments for this course[/]\n"
+                    )
                     no_res = await _add_nav_keys(
                         questionary.select(
                             "No resources available:",
                             choices=[
-                                questionary.Choice(title="Back to course list", value="back"),
+                                questionary.Choice(
+                                    title="Back to course list", value="back"
+                                ),
                             ],
                             instruction=_NAV_HINT,
                         )
@@ -428,7 +428,9 @@ async def main() -> None:
                         questionary.select(
                             "What would you like to do?",
                             choices=[
-                                questionary.Choice(title="Download files", value="download"),
+                                questionary.Choice(
+                                    title="Download files", value="download"
+                                ),
                             ],
                             instruction=_NAV_HINT,
                         )
@@ -448,7 +450,7 @@ async def main() -> None:
                         questionary.checkbox(
                             "Select files to download:",
                             choices=download_choices,
-                            instruction="(space=toggle, a=all, i=invert, enter=confirm, none=back, b=back, e=exit)",
+                            instruction="(space=toggle, a=all, i=invert, enter=confirm, none=back, b=back, q=quit)",
                         )
                     ).ask_async()
 
@@ -457,7 +459,9 @@ async def main() -> None:
                             return
                         continue
                     if not selected_files:
-                        console.print("[dim]No files selected, back to attachments[/]\n")
+                        console.print(
+                            "[dim]No files selected, back to attachments[/]\n"
+                        )
                         continue
 
                     default_dir = str(BUPTClient.DOWNLOAD_DIR)
@@ -473,7 +477,9 @@ async def main() -> None:
                     console.print()
 
         except httpx.HTTPStatusError as e:
-            console.print(f"[red]✗ HTTP error: {e.response.status_code} {e.request.url}[/]")
+            console.print(
+                f"[red]✗ HTTP error: {e.response.status_code} {e.request.url}[/]"
+            )
             sys.exit(1)
         except httpx.ConnectError:
             console.print("[red]✗ Connection failed, check your network[/]")
@@ -485,5 +491,10 @@ async def main() -> None:
             console.print("\n[dim]Cancelled[/]")
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Synchronous entry point for the CLI (used by project.scripts)."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli()

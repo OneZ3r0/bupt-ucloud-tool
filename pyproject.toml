@@ -12,4 +12,4 @@ dependencies = [
 ]
 
 [project.scripts]
-bupt-ucloud = "main:main"
+bupt-ucloud = "main:cli"
