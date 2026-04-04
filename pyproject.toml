@@ -1,10 +1,15 @@
 [project]
 name = "bupt-ucloud-tool"
 version = "0.1.0"
-description = "Add your description here"
+description = "BUPT uCloud course resource downloader CLI"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "bs4>=0.0.2",
-    "requests>=2.33.1",
+    "httpx[http2]>=0.28.1",
+    "pydantic>=2.12.5",
+    "questionary>=2.1.1",
+    "rich>=14.3.3",
 ]
+
+[project.scripts]
+bupt-ucloud = "main:main"
