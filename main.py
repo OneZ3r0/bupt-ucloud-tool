@@ -24,6 +24,7 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 from rich.table import Table
+from rich.text import Text
 
 # Constants
 CAS_LOGIN_URL = (
@@ -418,9 +419,12 @@ async def main() -> None:
                     att_table.add_column("#", style="dim", width=4)
                     att_table.add_column("Filename", style="cyan")
                     att_table.add_column("Size", style="green", justify="right")
-                    att_table.add_column("URL", style="dim", max_width=50)
+                    att_table.add_column("URL", style="dim", overflow="fold")
                     for i, a in enumerate(attachments, 1):
-                        att_table.add_row(str(i), a.name, a.size, a.url)
+                        # Apply OSC 8 hyperlink to ensure it is fully clickable in terminals
+                        url_text = Text(a.url)
+                        url_text.stylize(f"link {a.url}")
+                        att_table.add_row(str(i), a.name, a.size, url_text)
                     console.print(att_table)
                     console.print()
 
