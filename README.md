@@ -1,6 +1,6 @@
 # bupt-ucloud-tool
 
-Async CLI for downloading course resources from BUPT uCloud.
+Async CLI for browsing assignments and downloading course resources from BUPT uCloud.
 
 ## Usage
 

@@ -1,4 +1,4 @@
-"""BUPT uCloud CLI — async course resource downloader."""
+"""BUPT uCloud CLI — async assignment browser and resource downloader."""
 
 from __future__ import annotations
 
@@ -9,7 +9,9 @@ import os
 import re
 import sys
 import time
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import questionary
@@ -23,6 +25,7 @@ from rich.progress import (
     TextColumn,
     TransferSpeedColumn,
 )
+from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
@@ -32,6 +35,7 @@ CAS_LOGIN_URL = (
 )
 API_BASE = "https://apiucloud.bupt.edu.cn"
 API_TOKEN_URL = f"{API_BASE}/ykt-basics/oauth/token"
+FILE_BASE = "https://fileucloud.bupt.edu.cn/ucloud/document"
 
 YKT_HEADERS = {
     "Authorization": "Basic  cG9ydGFsOnBvcnRhbF9zZWNyZXQ=",
@@ -46,6 +50,15 @@ console = Console()
 _BACK = "__back__"
 _EXIT = "__exit__"
 _NAV_HINT = "(enter=confirm, b=back, q=quit)"
+_INVALID_PATH_CHARS_RE = re.compile(r'[\x00-\x1f<>:"/\\|?*]')
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 def _add_nav_keys(question: questionary.Question) -> questionary.Question:
@@ -61,6 +74,128 @@ def _add_nav_keys(question: questionary.Question) -> questionary.Question:
         event.app.exit(result=_EXIT)
 
     return question
+
+
+def _safe_path_component(value: str, fallback: str = "unnamed") -> str:
+    """Return a portable, non-traversing path component."""
+    cleaned = _INVALID_PATH_CHARS_RE.sub("_", value).strip(" .")
+    if not cleaned or cleaned in {".", ".."}:
+        cleaned = fallback
+    if cleaned.upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned[:120].rstrip(" .") or fallback
+
+
+def _safe_filename(value: str) -> str:
+    """Sanitize a server-provided filename while preserving its suffix."""
+    cleaned = _INVALID_PATH_CHARS_RE.sub("_", value).strip(" .")
+    if not cleaned or cleaned in {".", ".."}:
+        return "download"
+    path = Path(cleaned)
+    suffix = path.suffix[:20]
+    max_stem_length = 120 - len(suffix)
+    stem = path.stem[:max_stem_length].rstrip(" .") or "download"
+    if stem.upper() in _WINDOWS_RESERVED_NAMES:
+        stem = f"_{stem}"
+    return f"{stem}{suffix}"
+
+
+def _unique_destination(
+    dest_dir: Path, filename: str, reserved: set[Path] | None = None
+) -> Path:
+    """Choose a destination without overwriting disk or in-batch files."""
+    if reserved is None:
+        reserved = set()
+    safe_name = _safe_filename(filename)
+    candidate = dest_dir / safe_name
+    stem = Path(safe_name).stem
+    suffix = Path(safe_name).suffix
+    counter = 1
+    while candidate.exists() or candidate in reserved:
+        candidate = dest_dir / f"{stem} ({counter}){suffix}"
+        counter += 1
+    return candidate
+
+
+def _build_download_dir(base: Path, path_components: tuple[str, ...]) -> Path:
+    """Build a nested download directory from safe path components."""
+    for component in path_components:
+        base /= _safe_path_component(component)
+    return base
+
+
+class _AssignmentHTMLParser(HTMLParser):
+    """Convert assignment HTML into readable terminal text."""
+
+    _BLOCK_TAGS = {
+        "blockquote",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "table",
+        "tr",
+        "ul",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.links: list[tuple[str, int]] = []
+        self.ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = dict(attrs)
+        if tag in {"script", "style"}:
+            self.ignored_depth += 1
+            return
+        if self.ignored_depth:
+            return
+        if tag in self._BLOCK_TAGS or tag == "br":
+            self.parts.append("\n")
+        if tag == "a":
+            self.links.append((attrs_dict.get("href") or "", len(self.parts)))
+        elif tag == "img":
+            src = attrs_dict.get("src")
+            if src:
+                self.parts.append(f"\n[Image: {src}]\n")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"}:
+            self.ignored_depth = max(0, self.ignored_depth - 1)
+            return
+        if self.ignored_depth:
+            return
+        if tag == "a" and self.links:
+            href, start = self.links.pop()
+            label = "".join(self.parts[start:]).strip()
+            if href and href not in label:
+                self.parts.append(f" ({href})")
+        if tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self.ignored_depth:
+            self.parts.append(data)
+
+
+def _html_to_text(value: str) -> str:
+    """Convert HTML to compact plain text, retaining links and image URLs."""
+    parser = _AssignmentHTMLParser()
+    parser.feed(value)
+    parser.close()
+    lines = [" ".join(line.split()) for line in "".join(parser.parts).splitlines()]
+    return "\n".join(line for line in lines if line).strip()
 
 
 # Models
@@ -87,6 +222,59 @@ class Attachment(BaseModel):
     name: str
     url: str
     size: str = ""
+    filename: str | None = None
+    resource_id: str = ""
+    file_type: str = ""
+
+    @property
+    def download_name(self) -> str:
+        return self.filename or self.name
+
+
+class AssignmentSummary(BaseModel):
+    """Assignment entry returned by the course assignment list."""
+
+    id: str
+    assignment_title: str = Field(alias="assignmentTitle")
+    assignment_end_time: str = Field(default="", alias="assignmentEndTime")
+
+    model_config = {"populate_by_name": True}
+
+
+class AssignmentResource(BaseModel):
+    """Resource reference embedded in an assignment detail."""
+
+    resource_id: str = Field(alias="resourceId")
+    resource_name: str = Field(alias="resourceName")
+    resource_type: str = Field(default="", alias="resourceType")
+
+    model_config = {"populate_by_name": True}
+
+
+class AssignmentDetail(BaseModel):
+    """Full assignment content and its resource references."""
+
+    id: str
+    assignment_title: str = Field(alias="assignmentTitle")
+    assignment_content: str = Field(default="", alias="assignmentContent")
+    assignment_end_time: str = Field(default="", alias="assignmentEndTime")
+    resources: list[AssignmentResource] = Field(
+        default_factory=list, alias="assignmentResource"
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class ResourceMetadata(BaseModel):
+    """Storage metadata needed to construct an attachment download URL."""
+
+    id: str
+    name: str = ""
+    file_size_unit: str = Field(default="", alias="fileSizeUnit")
+    ext: str = ""
+    storage_id: str = Field(alias="storageId")
+
+    model_config = {"populate_by_name": True}
 
 
 # Client
@@ -95,7 +283,7 @@ class BUPTClient:
 
     SESSION_DIR = Path.home() / ".config" / "bupt-ucloud-tool"
     SESSION_FILE = SESSION_DIR / "session.json"
-    DOWNLOAD_DIR = Path.cwd() / "downloads"
+    DOWNLOAD_DIR = Path.cwd() / "Downloads"
 
     def __init__(self) -> None:
         self._session: Session | None = None
@@ -299,8 +487,159 @@ class BUPTClient:
                 size = inner.get("fileSizeUnit", "")
                 if url:
                     attachments.append(
-                        Attachment(name=f"[{resource_name}] {name}", url=url, size=size)
+                        Attachment(
+                            name=f"[{resource_name}] {name}",
+                            filename=name,
+                            url=url,
+                            size=size,
+                        )
                     )
+        return attachments
+
+    async def get_assignments(self, site_id: str) -> list[AssignmentSummary]:
+        """Fetch all assignment pages for a course in server order."""
+        assignments: list[AssignmentSummary] = []
+        current = 1
+        while True:
+            res = await self.client.post(
+                f"{API_BASE}/ykt-site/work/student/list",
+                json={
+                    "siteId": site_id,
+                    "userId": self.session.user_id,
+                    "keyword": "",
+                    "current": current,
+                    "size": 5,
+                    "studentAssignmentStatus": None,
+                    "status": 0,
+                    "sortColumn": "",
+                    "sortType": None,
+                },
+            )
+            res.raise_for_status()
+
+            data = res.json()
+            page = data.get("data") if isinstance(data, dict) else None
+            records = page.get("records") if isinstance(page, dict) else None
+            if not isinstance(records, list):
+                console.print(f"[red]✗ Unexpected assignment list format: {data}[/]")
+                return assignments
+
+            for record in records:
+                try:
+                    assignments.append(AssignmentSummary.model_validate(record))
+                except ValidationError:
+                    console.print("[yellow]⚠ Skipped an invalid assignment record[/]")
+
+            pages = page.get("pages", current)
+            if not isinstance(pages, int) or current >= pages:
+                break
+            current += 1
+
+        return assignments
+
+    async def get_assignment_detail(
+        self, assignment_id: str
+    ) -> AssignmentDetail | None:
+        """Fetch a single assignment's content and resource references."""
+        res = await self.client.get(
+            f"{API_BASE}/ykt-site/work/detail",
+            params={"assignmentId": assignment_id},
+        )
+        res.raise_for_status()
+
+        data = res.json()
+        detail = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(detail, dict):
+            console.print(f"[red]✗ Unexpected assignment detail format: {data}[/]")
+            return None
+        valid_resources: list[dict[str, object]] = []
+        raw_resources = detail.get("assignmentResource") or []
+        if isinstance(raw_resources, list):
+            for resource in raw_resources:
+                try:
+                    valid = AssignmentResource.model_validate(resource)
+                except ValidationError:
+                    console.print("[yellow]⚠ Skipped an invalid assignment resource[/]")
+                    continue
+                valid_resources.append(valid.model_dump(by_alias=True))
+        detail = {**detail, "assignmentResource": valid_resources}
+        try:
+            return AssignmentDetail.model_validate(detail)
+        except ValidationError:
+            console.print("[red]✗ Assignment detail is missing required fields[/]")
+            return None
+
+    async def _get_resource_metadata(self, resource_id: str) -> ResourceMetadata | None:
+        """Resolve one resource ID to its storage metadata."""
+        try:
+            res = await self.client.get(
+                f"{API_BASE}/blade-source/resource/list/byId",
+                params={"resourceIds": resource_id},
+            )
+            res.raise_for_status()
+        except httpx.HTTPError:
+            console.print(f"[yellow]⚠ Failed to resolve resource {resource_id}[/]")
+            return None
+
+        data = res.json()
+        records = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(records, list):
+            console.print(
+                f"[yellow]⚠ Unexpected metadata for resource {resource_id}; skipped[/]"
+            )
+            return None
+        for record in records:
+            if not isinstance(record, dict) or str(record.get("id")) != resource_id:
+                continue
+            try:
+                return ResourceMetadata.model_validate(record)
+            except ValidationError:
+                break
+        console.print(f"[yellow]⚠ Resource {resource_id} could not be resolved[/]")
+        return None
+
+    async def get_assignment_attachments(
+        self, resources: list[AssignmentResource]
+    ) -> list[Attachment]:
+        """Resolve assignment resources into downloadable attachments."""
+        metadata = await asyncio.gather(
+            *(
+                self._get_resource_metadata(resource.resource_id)
+                for resource in resources
+            )
+        )
+
+        attachments: list[Attachment] = []
+        for resource, resolved in zip(resources, metadata, strict=True):
+            if resolved is None:
+                continue
+            extension = re.sub(
+                r"[^A-Za-z0-9]",
+                "",
+                (resolved.ext or resource.resource_type).lstrip("."),
+            )
+            if not resolved.storage_id or not extension:
+                console.print(
+                    f"[yellow]⚠ Resource {resource.resource_id} has no storage ID "
+                    "or type; skipped[/]"
+                )
+                continue
+
+            filename = resource.resource_name or resolved.name or resource.resource_id
+            if not Path(filename).suffix:
+                filename = f"{filename}.{extension}"
+            storage_id = quote(resolved.storage_id, safe="")
+            encoded_ext = quote(extension, safe="")
+            attachments.append(
+                Attachment(
+                    name=filename,
+                    filename=filename,
+                    url=f"{FILE_BASE}/{storage_id}.{encoded_ext}",
+                    size=resolved.file_size_unit,
+                    resource_id=resource.resource_id,
+                    file_type=resource.resource_type or resolved.ext,
+                )
+            )
         return attachments
 
     # Download
@@ -308,20 +647,25 @@ class BUPTClient:
         self,
         dl_client: httpx.AsyncClient,
         att: Attachment,
-        dest_dir: Path,
+        dest: Path,
         progress: Progress,
         task_id: TaskID,
     ) -> None:
         """Stream-download a single file."""
-        dest = dest_dir / att.name.split("] ")[-1]
-        async with dl_client.stream("GET", att.url) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("Content-Length", 0))
-            progress.update(task_id, total=total or None)
-            with open(dest, "wb") as f:
-                async for chunk in resp.aiter_bytes(8192):
-                    f.write(chunk)
-                    progress.advance(task_id, len(chunk))
+        temp = dest.with_name(f".{dest.name}.part")
+        try:
+            async with dl_client.stream("GET", att.url) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("Content-Length", 0))
+                progress.update(task_id, total=total or None)
+                with temp.open("wb") as file:
+                    async for chunk in resp.aiter_bytes(8192):
+                        file.write(chunk)
+                        progress.advance(task_id, len(chunk))
+            temp.replace(dest)
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
 
     async def download_files(
         self, files: list[Attachment], dest_dir: Path | None = None
@@ -338,19 +682,234 @@ class BUPTClient:
                 TransferSpeedColumn(),
                 console=console,
             ) as progress:
-                tasks: list[tuple[Attachment, TaskID]] = []
+                tasks: list[tuple[Attachment, Path, TaskID]] = []
+                reserved: set[Path] = set()
                 for att in files:
-                    tid = progress.add_task("download", filename=att.name, total=None)
-                    tasks.append((att, tid))
+                    destination = _unique_destination(
+                        dest, att.download_name, reserved=reserved
+                    )
+                    reserved.add(destination)
+                    tid = progress.add_task(
+                        "download", filename=destination.name, total=None
+                    )
+                    tasks.append((att, destination, tid))
 
                 await asyncio.gather(
                     *(
-                        self._download_one(dl_client, att, dest, progress, tid)
-                        for att, tid in tasks
+                        self._download_one(dl_client, att, destination, progress, tid)
+                        for att, destination, tid in tasks
                     )
                 )
 
         console.print(f"\n[green]✓ Downloaded {len(files)} file(s) to {dest}[/]")
+
+
+# CLI helpers
+def _print_attachments(
+    attachments: list[Attachment], *, title: str, show_resource_info: bool = False
+) -> None:
+    table = Table(title=title, show_lines=True)
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Filename", style="cyan")
+    if show_resource_info:
+        table.add_column("Type", style="magenta")
+        table.add_column("Resource ID", style="dim")
+    table.add_column("Size", style="green", justify="right")
+    table.add_column("URL", style="dim", overflow="fold")
+    for index, attachment in enumerate(attachments, 1):
+        url_text = Text(attachment.url)
+        url_text.stylize(f"link {attachment.url}")
+        row: list[str | Text] = [str(index), Text(attachment.name)]
+        if show_resource_info:
+            row.extend([Text(attachment.file_type), Text(attachment.resource_id)])
+        row.extend([attachment.size, url_text])
+        table.add_row(*row)
+    console.print(table)
+    console.print()
+
+
+async def _prompt_download(
+    client: BUPTClient,
+    attachments: list[Attachment],
+    path_components: tuple[str, ...] = (),
+) -> bool:
+    """Prompt for files and destination; return True when the user quits."""
+    choices = [
+        questionary.Choice(
+            title=f"{attachment.name} ({attachment.size})", value=attachment
+        )
+        for attachment in attachments
+    ]
+    selected_files = await _add_nav_keys(
+        questionary.checkbox(
+            "Select files to download:",
+            choices=choices,
+            instruction=(
+                "(space=toggle, a=all, i=invert, enter=confirm, "
+                "none=back, b=back, q=quit)"
+            ),
+        )
+    ).ask_async()
+    if selected_files == _EXIT:
+        return True
+    if selected_files == _BACK:
+        return False
+    if not selected_files:
+        console.print("[dim]No files selected, back to attachments[/]\n")
+        return False
+
+    dest_input: str | None = await questionary.text(
+        "Download directory:", default=str(BUPTClient.DOWNLOAD_DIR)
+    ).ask_async()
+    if not dest_input:
+        return False
+
+    dest_dir = _build_download_dir(
+        Path(dest_input).expanduser().resolve(), path_components
+    )
+    await client.download_files(selected_files, dest_dir=dest_dir)
+    console.print()
+    return False
+
+
+async def browse_course_resources(client: BUPTClient, course: Course) -> bool:
+    """Run the existing course-resource workflow; return True on quit."""
+    console.print(Text(f"\n📂 Fetching resources for [{course.site_name}]...", style="bold"))
+    attachments = await client.get_resources(course.id)
+    if not attachments:
+        console.print("[yellow]No downloadable attachments for this course[/]\n")
+        action = await _add_nav_keys(
+            questionary.select(
+                "No resources available:",
+                choices=[questionary.Choice(title="Back", value="back")],
+                instruction=_NAV_HINT,
+            )
+        ).ask_async()
+        return action == _EXIT
+
+    while True:
+        _print_attachments(attachments, title="📎 Course Attachments")
+        action = await _add_nav_keys(
+            questionary.select(
+                "What would you like to do?",
+                choices=[
+                    questionary.Choice(title="Download files", value="download"),
+                    questionary.Choice(title="Back", value="back"),
+                ],
+                instruction=_NAV_HINT,
+            )
+        ).ask_async()
+        if action == _EXIT:
+            return True
+        if action in (_BACK, "back", None):
+            console.print()
+            return False
+        if await _prompt_download(client, attachments):
+            return True
+
+
+def _print_assignment_detail(detail: AssignmentDetail) -> None:
+    content = _html_to_text(detail.assignment_content) or "No assignment content"
+    title = Text(detail.assignment_title)
+    console.print(Panel(Text(content), title=title, border_style="cyan"))
+    metadata = Text()
+    metadata.append("Deadline: ", style="bold")
+    metadata.append(detail.assignment_end_time or "—")
+    metadata.append("    Assignment ID: ", style="bold")
+    metadata.append(detail.id)
+    console.print(metadata)
+    console.print()
+
+
+async def browse_assignments(client: BUPTClient, course: Course) -> bool:
+    """Browse assignment details and attachments; return True on quit."""
+    console.print(Text(f"\n📝 Fetching assignments for [{course.site_name}]...", style="bold"))
+    assignments = await client.get_assignments(course.id)
+    if not assignments:
+        console.print("[yellow]No assignments found for this course[/]\n")
+        action = await _add_nav_keys(
+            questionary.select(
+                "No assignments available:",
+                choices=[questionary.Choice(title="Back", value="back")],
+                instruction=_NAV_HINT,
+            )
+        ).ask_async()
+        return action == _EXIT
+
+    while True:
+        table = Table(title="📝 Assignments", show_lines=True)
+        table.add_column("#", style="dim", width=4)
+        table.add_column("Title", style="cyan")
+        table.add_column("Deadline", style="green")
+        table.add_column("ID", style="dim")
+        for index, assignment in enumerate(assignments, 1):
+            table.add_row(
+                str(index),
+                Text(assignment.assignment_title),
+                assignment.assignment_end_time or "—",
+                assignment.id,
+            )
+        console.print(table)
+
+        selected = await _add_nav_keys(
+            questionary.select(
+                "Select an assignment:",
+                choices=[
+                    questionary.Choice(
+                        title=assignment.assignment_title, value=assignment
+                    )
+                    for assignment in assignments
+                ],
+                instruction=_NAV_HINT,
+            )
+        ).ask_async()
+        if selected == _EXIT:
+            return True
+        if selected in (_BACK, None):
+            console.print()
+            return False
+
+        detail = await client.get_assignment_detail(selected.id)
+        if detail is None:
+            continue
+        attachments = await client.get_assignment_attachments(detail.resources)
+
+        while True:
+            _print_assignment_detail(detail)
+            if attachments:
+                _print_attachments(
+                    attachments,
+                    title="📎 Assignment Attachments",
+                    show_resource_info=True,
+                )
+                choices = [
+                    questionary.Choice(title="Download files", value="download"),
+                    questionary.Choice(title="Back to assignments", value="back"),
+                ]
+            else:
+                console.print("[dim]No downloadable attachments[/]\n")
+                choices = [
+                    questionary.Choice(title="Back to assignments", value="back")
+                ]
+
+            action = await _add_nav_keys(
+                questionary.select(
+                    "What would you like to do?",
+                    choices=choices,
+                    instruction=_NAV_HINT,
+                )
+            ).ask_async()
+            if action == _EXIT:
+                return True
+            if action in (_BACK, "back", None):
+                console.print()
+                break
+            if await _prompt_download(
+                client,
+                attachments,
+                path_components=(course.site_name, detail.assignment_title),
+            ):
+                return True
 
 
 # CLI Entry
@@ -373,112 +932,51 @@ async def main() -> None:
                 table.add_column("#", style="dim", width=4)
                 table.add_column("Course Name", style="cyan")
                 table.add_column("ID", style="dim")
-                for i, c in enumerate(courses, 1):
-                    table.add_row(str(i), c.site_name, c.id)
+                for index, course in enumerate(courses, 1):
+                    table.add_row(str(index), Text(course.site_name), course.id)
                 console.print(table)
 
-                course_choices = [
-                    questionary.Choice(title=c.site_name, value=c) for c in courses
-                ]
                 selected = await _add_nav_keys(
                     questionary.select(
                         "Select a course:",
-                        choices=course_choices,
+                        choices=[
+                            questionary.Choice(title=course.site_name, value=course)
+                            for course in courses
+                        ],
                         instruction=_NAV_HINT,
                     )
                 ).ask_async()
                 if not selected or selected in (_BACK, _EXIT):
                     return
 
-                console.print(
-                    f"\n[bold]📂 Fetching resources for [{selected.site_name}]...[/]"
-                )
-                attachments = await client.get_resources(selected.id)
-                if not attachments:
-                    console.print(
-                        "[yellow]No downloadable attachments for this course[/]\n"
-                    )
-                    no_res = await _add_nav_keys(
-                        questionary.select(
-                            "No resources available:",
-                            choices=[
-                                questionary.Choice(
-                                    title="Back to course list", value="back"
-                                ),
-                            ],
-                            instruction=_NAV_HINT,
-                        )
-                    ).ask_async()
-                    if no_res == _EXIT:
-                        return
-                    console.print()
-                    continue
-
                 while True:
-                    att_table = Table(title="📎 Attachments", show_lines=True)
-                    att_table.add_column("#", style="dim", width=4)
-                    att_table.add_column("Filename", style="cyan")
-                    att_table.add_column("Size", style="green", justify="right")
-                    att_table.add_column("URL", style="dim", overflow="fold")
-                    for i, a in enumerate(attachments, 1):
-                        # Apply OSC 8 hyperlink to ensure it is fully clickable in terminals
-                        url_text = Text(a.url)
-                        url_text.stylize(f"link {a.url}")
-                        att_table.add_row(str(i), a.name, a.size, url_text)
-                    console.print(att_table)
-                    console.print()
-
                     action = await _add_nav_keys(
                         questionary.select(
-                            "What would you like to do?",
+                            f"Choose content for {selected.site_name}:",
                             choices=[
                                 questionary.Choice(
-                                    title="Download files", value="download"
+                                    title="Course resources", value="resources"
+                                ),
+                                questionary.Choice(
+                                    title="Assignments", value="assignments"
                                 ),
                             ],
                             instruction=_NAV_HINT,
                         )
                     ).ask_async()
-
+                    if action == _EXIT:
+                        return
                     if action in (_BACK, None):
                         console.print()
                         break
-                    if action == _EXIT:
+
+                    should_exit = (
+                        await browse_course_resources(client, selected)
+                        if action == "resources"
+                        else await browse_assignments(client, selected)
+                    )
+                    if should_exit:
                         return
-
-                    download_choices = [
-                        questionary.Choice(title=f"{a.name} ({a.size})", value=a)
-                        for a in attachments
-                    ]
-                    selected_files = await _add_nav_keys(
-                        questionary.checkbox(
-                            "Select files to download:",
-                            choices=download_choices,
-                            instruction="(space=toggle, a=all, i=invert, enter=confirm, none=back, b=back, q=quit)",
-                        )
-                    ).ask_async()
-
-                    if selected_files in (_BACK, _EXIT):
-                        if selected_files == _EXIT:
-                            return
-                        continue
-                    if not selected_files:
-                        console.print(
-                            "[dim]No files selected, back to attachments[/]\n"
-                        )
-                        continue
-
-                    default_dir = str(BUPTClient.DOWNLOAD_DIR)
-                    dest_input: str | None = await questionary.text(
-                        "Download directory:",
-                        default=default_dir,
-                    ).ask_async()
-                    if not dest_input:
-                        continue
-                    dest_dir = Path(dest_input).expanduser().resolve()
-
-                    await client.download_files(selected_files, dest_dir=dest_dir)
-                    console.print()
 
         except httpx.HTTPStatusError as e:
             console.print(
